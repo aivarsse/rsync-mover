@@ -1,0 +1,505 @@
+#!/usr/bin/env bash
+# mover — interactive push/pull of files between this machine and a remote
+# host, over rsync via ssh.
+
+set -euo pipefail
+
+script_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -- "$(dirname -- "$src")" && pwd -P)"
+    src="$(readlink -- "$src")"
+    [[ "$src" == /* ]] || src="$dir/$src"
+  done
+  cd -- "$(dirname -- "$src")" && pwd -P
+}
+
+CONFIG_DIR="${MOVER_CONFIG_DIR:-$(script_dir)}"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mover"
+STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/mover/profile"
+BASE_SSH_OPTS="-o RemoteCommand=none -o BatchMode=yes -o ConnectTimeout=5"
+BASE_SSH_OPTS+=" -o ControlMaster=auto -o ControlPersist=60"
+
+valid_profile() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
+
+shell_quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
+remembered_profile() {
+  local p=""
+  [[ -r "$STATE_FILE" ]] && read -r p < "$STATE_FILE"
+  if [[ -n "$p" ]] && valid_profile "$p" && [[ -f "$CONFIG_DIR/$p.conf" ]]; then
+    printf '%s\n' "$p"
+  else
+    printf 'mover\n'
+  fi
+}
+
+remember_profile() {
+  mkdir -p -m 700 "${STATE_FILE%/*}" 2>/dev/null || true
+  printf '%s\n' "$PROFILE" > "$STATE_FILE" 2>/dev/null \
+    || echo "mover: could not save the profile choice to $STATE_FILE" >&2
+}
+
+write_template() {
+  mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+  if ! : > "$CONFIG_FILE" 2>/dev/null; then
+    echo "mover: cannot write $CONFIG_FILE" >&2
+    echo "mover: set MOVER_CONFIG_DIR to a writable directory" >&2
+    exit 1
+  fi
+  cat > "$CONFIG_FILE" <<'EOF'
+# mover profile. HOST is required; the rest may be left empty.
+HOST=
+
+# Identity file. Empty means ssh decides: agent keys, ~/.ssh/config, defaults.
+KEY=
+
+# Remote paths are anchored under this. Empty means the remote home directory.
+# A leading slash makes it absolute, e.g. /srv/data
+REMOTE_ROOT=
+
+# Space-separated rsync exclude patterns, globs allowed. Empty means none.
+EXCLUDES=
+
+# Menu questions: ask (default), yes to skip the question and always do it,
+# no to skip it and never do it. Only affects interactive mode.
+DELETE_MODE=ask
+DRY_RUN_MODE=ask
+GITIGNORE_MODE=ask
+EOF
+
+  echo "mover: wrote a blank profile to $CONFIG_FILE" >&2
+}
+
+load_config() {
+  valid_profile "$PROFILE" \
+    || { echo "mover: invalid profile name '$PROFILE'" >&2; exit 2; }
+  CONFIG_FILE="$CONFIG_DIR/$PROFILE.conf"
+  CACHE_FILE="$CACHE_DIR/$PROFILE.paths"
+  [[ -f "$CONFIG_FILE" ]] || write_template
+  unset HOST KEY REMOTE_ROOT EXCLUDES \
+        DELETE_MODE DRY_RUN_MODE GITIGNORE_MODE
+  if ! source "$CONFIG_FILE"; then
+    echo "mover: $CONFIG_FILE has a syntax error — using what could be read" >&2
+  fi
+  HOST="${HOST:-}"
+  KEY="${KEY:-}"
+  KEY="${KEY/#\~/$HOME}"
+  REMOTE_ROOT="${REMOTE_ROOT:-.}"
+  EXCLUDES="${EXCLUDES:-}"
+  DELETE_MODE="${DELETE_MODE:-ask}"
+  DRY_RUN_MODE="${DRY_RUN_MODE:-ask}"
+  GITIGNORE_MODE="${GITIGNORE_MODE:-ask}"
+  local m
+  for m in DELETE_MODE DRY_RUN_MODE GITIGNORE_MODE; do
+    case "${!m}" in
+      ask|yes|no) ;;
+      *) echo "mover: $m must be ask, yes or no — using ask" >&2; printf -v "$m" ask ;;
+    esac
+  done
+
+  mkdir -p -m 700 "$HOME/.ssh" 2>/dev/null || true
+  local ctl="$HOME/.ssh/mover-$PROFILE-%C"
+  SSH_CMD=(ssh $BASE_SSH_OPTS -o "ControlPath=$ctl")
+  RSH="ssh $BASE_SSH_OPTS -o 'ControlPath=$ctl'"
+  if [[ -n "$KEY" ]]; then
+    SSH_CMD+=(-i "$KEY")
+    RSH+=" -i '$KEY'"
+  fi
+}
+
+require_host() {
+  [[ -n "$HOST" ]] && return 0
+  echo "mover: HOST is not set in $CONFIG_FILE — run config to set it" >&2
+  exit 1
+}
+
+usage() { awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; }
+
+edit_config() { "${VISUAL:-${EDITOR:-vi}}" "$CONFIG_FILE"; }
+
+profiles() {
+  local f n
+  for f in "$CONFIG_DIR"/*.conf; do
+    [[ -e "$f" ]] || continue
+    n="${f##*/}"
+    printf '%s\n' "${n%.conf}"
+  done
+}
+
+rsync_error() {
+  local msg
+  case "$1" in
+    1)     msg="unknown option — the local or remote rsync is too old (--mkpath needs 3.2.3+)" ;;
+    2)     msg="remote rsync is too old to talk to this one" ;;
+    3)     msg="could not read the source path — check it exists and is readable" ;;
+    5)     msg="could not start the client-server protocol" ;;
+    11|13) msg="file I/O error — check permissions and free space" ;;
+    12)    msg="ssh or protocol failure" ;;
+    20)    msg="interrupted" ;;
+    23)    msg="partial transfer: some files were skipped" ;;
+    24)    msg="partial transfer: some source files vanished mid-run" ;;
+    25)    msg="hit the deletion cap ($MAX_DELETE): up to $MAX_DELETE were deleted, the rest skipped — raise it with -m" ;;
+    30|35) msg="timed out" ;;
+    255)   msg="ssh failed to connect" ;;
+    *)     msg="rsync failed" ;;
+  esac
+  echo "mover: $msg (rsync exit $1)" >&2
+}
+
+dry_run_legend() {
+  cat >&2 <<'EOF'
+  key: >f sending file  cd creating dir  .f unchanged  *deleting removing
+       trailing letters = what differs: s size, t time, p perms, o owner, g group
+EOF
+}
+
+build_args() {
+  local x
+  RSYNC_ARGS=(-a --mkpath -e "$RSH")
+  set -f
+  for x in $EXCLUDES; do RSYNC_ARGS+=(--exclude "$x"); done
+  set +f
+  for x in "${EXTRA_EXCLUDES[@]}"; do RSYNC_ARGS+=(--exclude "$x"); done
+  [[ $GITIGNORE -eq 1 ]] && RSYNC_ARGS+=("--filter=:- .gitignore")
+  [[ $DRY_RUN -eq 1 ]] && RSYNC_ARGS+=(--dry-run --itemize-changes)
+  [[ $VERBOSE -eq 1 ]] && RSYNC_ARGS+=(--info=progress2,stats1)
+  if [[ $DELETE -eq 1 ]]; then
+    RSYNC_ARGS+=(--delete)
+    [[ "$MAX_DELETE" == none ]] || RSYNC_ARGS+=("--max-delete=$MAX_DELETE")
+  fi
+  return 0
+}
+
+run_rsync() {
+  local rc=0
+  rsync "${RSYNC_ARGS[@]}" -- "$@" || rc=$?
+  [[ $rc -eq 0 ]] || { rsync_error "$rc"; return "$rc"; }
+  if [[ $DRY_RUN -eq 1 ]]; then dry_run_legend; else echo "✓ $1 -> $2"; fi
+}
+
+confirm_delete() {
+  [[ $DELETE -eq 1 && $ASSUME_YES -eq 0 && -t 0 ]] || return 0
+  yn "--delete will remove files under $1 that aren't in the source. continue?" \
+    || { echo "aborted" >&2; exit 1; }
+}
+
+do_push() { build_args; run_rsync "$1" "$HOST:$2"; }
+do_pull() { build_args; run_rsync "$HOST:$1" "$2"; }
+
+do_ls() {
+  local out rc=0
+  out="$(rsync --list-only -e "$RSH" -- "$HOST:$1/")" || rc=$?
+  [[ $rc -eq 0 ]] || { rsync_error "$rc"; return "$rc"; }
+  printf '%s\n' "$out"
+  [[ "$1" == "$REMOTE_ROOT" ]] || return 0
+  mkdir -p -m 700 "$CACHE_DIR"
+  printf '%s\n' "$out" | sed -E '
+      /^l/ s/ -> .*$//
+      s/^[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ //
+      /^\.$/d
+      /^$/d' > "$CACHE_FILE"
+}
+
+do_check() {
+  local remote rc=0 lver lmkpath rver rmkpath rroot
+
+  lver="$(rsync --version | awk 'NR==1{print $3; exit}')"
+  [[ "$(rsync --help 2>&1)" == *--mkpath* ]] && lmkpath=yes || lmkpath=no
+
+  echo "profile:      $PROFILE ($CONFIG_FILE)"
+  echo "host:         $HOST"
+  if [[ -z "$KEY" ]]; then
+    echo "key:          (none set — ssh will choose)"
+  elif [[ -r "$KEY" ]]; then
+    echo "key:          $KEY (mode $(stat -c %a "$KEY" 2>/dev/null || echo '?'))"
+  else
+    echo "key:          $KEY — MISSING or unreadable"
+  fi
+  echo "excludes:     ${EXCLUDES:-(none)}"
+
+  remote="$("${SSH_CMD[@]}" "$HOST" "
+      rsync --version | awk 'NR==1 { print \$3; exit }'
+      rsync --help 2>&1 | grep -q -- --mkpath && echo yes || echo no
+      test -d $(shell_quote "$REMOTE_ROOT") && echo yes || echo no
+    " 2>&1)" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "connection:   FAILED (ssh exit $rc)"
+    printf '%s\n' "$remote" | sed 's/^/              /'
+    return 1
+  fi
+  echo "connection:   ok"
+
+  { read -r rver; read -r rmkpath; read -r rroot; } \
+    <<<"$(printf '%s\n' "$remote" | tail -3)"
+
+  echo "rsync:        $lver local / $rver remote"
+  if [[ $lmkpath == yes && $rmkpath == yes ]]; then
+    echo "mkpath:       supported both ends"
+  else
+    local where="local"
+    [[ $lmkpath == yes ]] && where="remote"
+    [[ $lmkpath == no && $rmkpath == no ]] && where="both ends"
+    echo "mkpath:       MISSING on $where — transfers will fail, needs rsync 3.2.3+"
+  fi
+  if [[ $rroot == yes ]]; then
+    echo "remote root:  $REMOTE_ROOT (exists)"
+  elif [[ $rmkpath == yes ]]; then
+    echo "remote root:  $REMOTE_ROOT (missing — --mkpath will create it)"
+  else
+    echo "remote root:  $REMOTE_ROOT (missing — and no --mkpath to create it)"
+  fi
+}
+
+local_base() {
+  local p="$1"
+  [[ -d "$p" ]] && p="$(cd -- "$p" && pwd)"
+  p="${p%/}"; p="${p##*/}"
+  [[ -n "$p" ]] || { echo "mover: no remote name to derive from '$1'" >&2; return 1; }
+  printf '%s\n' "$p"
+}
+
+remote_path() {
+  local p="$1"
+  [[ "$p" == /* || "$p" == "$REMOTE_ROOT" || "$p" == "$REMOTE_ROOT"/* ]] \
+    && { printf '%s\n' "$p"; return 0; }
+  printf '%s/%s\n' "$REMOTE_ROOT" "$p"
+}
+
+completion() {
+  cat <<'EOF'
+_mover() {
+  local cur prev cmd
+  COMPREPLY=()
+  cmd="${COMP_WORDS[0]}"
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+  case "$prev" in
+    -H) mapfile -t COMPREPLY < <(compgen -W "$("$cmd" profiles 2>/dev/null)" -- "$cur"); return ;;
+    -e) return ;;
+  esac
+  if [[ $COMP_CWORD -eq 1 ]]; then
+    mapfile -t COMPREPLY < <(compgen -W "push pull ls check config profiles completion" -- "$cur")
+    return
+  fi
+  case "${COMP_WORDS[1]}" in
+    pull|ls)
+      local line
+      while IFS= read -r line; do
+        [[ "$line" == "$cur"* ]] && COMPREPLY+=("$line")
+      done < <("$cmd" paths 2>/dev/null)
+      ;;
+    *) mapfile -t COMPREPLY < <(compgen -f -- "$cur") ;;
+  esac
+}
+complete -o filenames -F _mover mover
+EOF
+}
+
+run_cli() {
+  local op="$1" src dst
+  shift
+
+  case "$op" in push|pull|ls|check) require_host ;; esac
+
+  case "$op" in
+    push)
+      src="${1:-.}"; dst="${2:-}"
+      if [[ -n "$dst" ]]; then
+        dst="$(remote_path "$dst")"
+      elif [[ -d "$src" ]]; then
+        src="${src%/}/"
+        dst="$REMOTE_ROOT/$(local_base "$src")/"
+      else
+        dst="$REMOTE_ROOT/"
+      fi
+      confirm_delete "$HOST:$dst"
+      do_push "$src" "$dst"
+      ;;
+    pull)
+      [[ $# -ge 1 ]] || { usage >&2; exit 2; }
+      src="$(remote_path "$1")"; dst="${2:-$PWD}"
+      confirm_delete "$dst"
+      do_pull "$src" "$dst"
+      ;;
+    ls)         do_ls "$(remote_path "${1:-$REMOTE_ROOT}")" ;;
+    check)      do_check ;;
+    config)     edit_config ;;
+    profiles)   profiles ;;
+    paths)      cat "$CACHE_FILE" 2>/dev/null || true ;;
+    completion) completion ;;
+    *)
+      echo "mover: unknown operation '$op' (flags go after the operation)" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+ask() {
+  local a
+  read -r -e -i "$2" -p "$1: " a || { echo; return 1; }
+  [[ -n "$a" ]] || return 1
+  printf '%s\n' "$a"
+}
+
+yn() {
+  local a def="${2:-n}" hint="[y/N]"
+  [[ "$def" == y ]] && hint="[Y/n]"
+  read -r -p "$1 $hint " a || return 1
+  [[ "${a:-$def}" =~ ^[Yy] ]]
+}
+
+cancelled() { echo "cancelled"; }
+
+have_host() {
+  [[ -n "$HOST" ]] && return 0
+  echo "HOST is not set — press 4 to edit $CONFIG_FILE"
+  return 1
+}
+
+want() {
+  case "$1" in
+    yes) printf -v "$2" 1 ;;
+    no)  printf -v "$2" 0 ;;
+    *)   if yn "$3"; then printf -v "$2" 1; else printf -v "$2" 0; fi ;;
+  esac
+}
+
+maybe_dry_run() {
+  case "$DRY_RUN_MODE" in
+    no)  return 0 ;;
+    yes) ;;
+    *)   yn "dry run first?" || return 0 ;;
+  esac
+  DRY_RUN=1 "$@" || true
+}
+
+switch_profile() {
+  local -a list
+  local i n pick
+  mapfile -t list < <(profiles)
+  if [[ ${#list[@]} -eq 0 ]]; then
+    echo "no profiles in $CONFIG_DIR"
+    return 0
+  fi
+  for i in "${!list[@]}"; do
+    n=$((i + 1))
+    if [[ "${list[i]}" == "$PROFILE" ]]; then
+      printf '  %d) %s  (current)\n' "$n" "${list[i]}"
+    else
+      printf '  %d) %s\n' "$n" "${list[i]}"
+    fi
+  done
+  pick="$(ask "profile number" "")" || { cancelled; return 0; }
+  [[ "$pick" =~ ^[0-9]+$ ]] && (( 10#$pick >= 1 && 10#$pick <= ${#list[@]} )) \
+    || { echo "invalid choice"; return 0; }
+  pick=$((10#$pick - 1))
+  [[ "${list[pick]}" == "$PROFILE" ]] && return 0
+  PROFILE="${list[pick]}"
+  load_config
+  remember_profile
+  PUSH_DST="" PULL_SRC=""
+}
+
+interactive() {
+  local choice src dst ddst tag
+  while true; do
+    cat <<EOF
+
+==== mover — $PROFILE: ${HOST:-(no host set)} ====
+
+  1) push  local -> remote
+  2) pull  remote -> local
+  3) ls
+  4) edit config
+  5) switch profile
+  6) check connection
+  q) quit
+
+EOF
+    read -r -p "choice: " choice || exit 0
+    echo
+    VERBOSE=1 DELETE=0 GITIGNORE=0 EXTRA_EXCLUDES=()
+    case "$choice" in
+      1)
+        have_host || continue
+        src="$(ask "local path (trailing / = contents)" "${PUSH_SRC:-$PWD/}")" \
+          || { cancelled; continue; }
+        [[ "$src" == "$PUSH_SRC" ]] || PUSH_DST=""
+        if [[ -d "$src" ]]; then
+          ddst="$REMOTE_ROOT/$(local_base "$src")/" || { PUSH_SRC="$src"; continue; }
+        elif [[ -e "${src%/}" ]]; then
+          src="${src%/}"
+          ddst="$REMOTE_ROOT/"
+        else
+          echo "no such path: $src"
+          PUSH_SRC="$src"
+          continue
+        fi
+        PUSH_SRC="$src"
+        dst="$(ask "remote path" "${PUSH_DST:-$ddst}")" || { cancelled; continue; }
+        PUSH_DST="$dst"
+        want "$GITIGNORE_MODE" GITIGNORE "honor .gitignore?"
+        want "$DELETE_MODE" DELETE "delete extraneous files on the remote?"
+        maybe_dry_run do_push "$src" "$dst"
+        [[ $DELETE -eq 1 ]] && tag=" (with --delete)" || tag=""
+        yn "push $src -> $dst$tag ?" y && { do_push "$src" "$dst" || true; }
+        ;;
+      2)
+        have_host || continue
+        src="$(ask "remote path (under $REMOTE_ROOT)" "${PULL_SRC:-$REMOTE_ROOT/}")" \
+          || { cancelled; continue; }
+        PULL_SRC="$src"
+        src="$(remote_path "$src")"
+        dst="$(ask "local destination" "${PULL_DST:-$PWD}")" || { cancelled; continue; }
+        PULL_DST="$dst"
+        want "$DELETE_MODE" DELETE "delete extraneous files locally?"
+        maybe_dry_run do_pull "$src" "$dst"
+        [[ $DELETE -eq 1 ]] && tag=" (with --delete)" || tag=""
+        yn "pull $src -> $dst$tag ?" y && { do_pull "$src" "$dst" || true; }
+        ;;
+      3)
+        have_host || continue
+        dst="$(ask "remote path to list" "$REMOTE_ROOT")" || { cancelled; continue; }
+        do_ls "$(remote_path "$dst")" || true
+        ;;
+      4) edit_config; load_config ;;
+      5) switch_profile ;;
+      6) have_host && { do_check || true; } ;;
+      q|Q) exit 0 ;;
+      *) echo "invalid choice" ;;
+    esac
+  done
+}
+
+PROFILE="${MOVER_PROFILE:-$(remembered_profile)}"
+DRY_RUN=0 VERBOSE=0 DELETE=0 GITIGNORE=0 ASSUME_YES=0 MAX_DELETE=1000
+PUSH_SRC="" PUSH_DST="" PULL_SRC="" PULL_DST=""
+EXTRA_EXCLUDES=()
+
+[[ $# -eq 0 ]] && { load_config; interactive; exit 0; }
+[[ "$1" == "-h" || "$1" == "--help" ]] && { usage; exit 0; }
+
+op="$1"; shift
+while getopts "nvdgym:H:e:h" opt; do
+  case "$opt" in
+    n) DRY_RUN=1 ;;
+    v) VERBOSE=1 ;;
+    d) DELETE=1 ;;
+    g) GITIGNORE=1 ;;
+    y) ASSUME_YES=1 ;;
+    m) [[ "$OPTARG" == none || "$OPTARG" =~ ^[0-9]+$ ]] \
+         || { echo "mover: -m takes a number or 'none'" >&2; exit 2; }
+       MAX_DELETE="$OPTARG" ;;
+    H) valid_profile "$OPTARG" || { echo "mover: invalid profile name '$OPTARG'" >&2; exit 2; }
+       PROFILE="$OPTARG" ;;
+    e) EXTRA_EXCLUDES+=("$OPTARG") ;;
+    h) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+load_config
+run_cli "$op" "$@"
